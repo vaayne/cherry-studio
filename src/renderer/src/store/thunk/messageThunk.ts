@@ -612,6 +612,7 @@ const fetchAndProcessAssistantResponseImpl = async (
       },
       onComplete: async (status: AssistantMessageStatus, response?: Response) => {
         cancelThrottledBlockUpdate()
+        let newThinkingBlockForDB: MessageBlock | null = null
 
         const finalStateOnComplete = getState()
         const finalAssistantMsg = finalStateOnComplete.messages.entities[assistantMsgId]
@@ -638,7 +639,37 @@ const fetchAndProcessAssistantResponseImpl = async (
             const usage = await estimateMessagesUsage({ assistant, messages: finalContextWithAssistant })
             response.usage = usage
           }
+
+          // Handle reasoning_content for non-streaming
+          if (
+            response &&
+            response.choices &&
+            response.choices[0] &&
+            response.choices[0].message &&
+            response.choices[0].message.reasoning_content
+          ) {
+            const reasoningText = response.choices[0].message.reasoning_content
+            if (reasoningText) {
+              const newThinkingBlock = createThinkingBlock(assistantMsgId, reasoningText, {
+                status: MessageBlockStatus.SUCCESS,
+                thinking_millsec: 0
+              })
+              newThinkingBlockForDB = newThinkingBlock
+              dispatch(upsertOneBlock(newThinkingBlock))
+
+              const currentBlocksFromState = getState().messages.entities[assistantMsgId]?.blocks || []
+              const updatedBlockIds = [...new Set([...currentBlocksFromState, newThinkingBlock.id])]
+              dispatch(
+                newMessagesActions.updateMessage({
+                  topicId,
+                  messageId: assistantMsgId,
+                  updates: { blocks: updatedBlockIds }
+                })
+              )
+            }
+          }
         }
+
         if (response && response.metrics) {
           if (response.metrics.completion_tokens === 0 && response.usage?.completion_tokens) {
             response = {
@@ -651,15 +682,40 @@ const fetchAndProcessAssistantResponseImpl = async (
           }
         }
 
-        const messageUpdates: Partial<Message> = { status, metrics: response?.metrics, usage: response?.usage }
-        dispatch(
-          newMessagesActions.updateMessage({
-            topicId,
-            messageId: assistantMsgId,
-            updates: messageUpdates
-          })
-        )
-        saveUpdatesToDB(assistantMsgId, topicId, messageUpdates, [])
+        const stateForFinalSave = getState()
+        const messageForFinalSave = stateForFinalSave.messages.entities[assistantMsgId]
+        const blocksToAlsoSaveToDB: MessageBlock[] = []
+        if (newThinkingBlockForDB) {
+          blocksToAlsoSaveToDB.push(newThinkingBlockForDB)
+        }
+
+        if (messageForFinalSave) {
+          const finalMessagePropertiesUpdate: Partial<Message> = {
+            status,
+            metrics: response?.metrics,
+            usage: response?.usage,
+            blocks: messageForFinalSave.blocks // Ensure blocks array includes newThinkingBlock's ID
+          }
+          dispatch(
+            newMessagesActions.updateMessage({
+              topicId,
+              messageId: assistantMsgId,
+              updates: finalMessagePropertiesUpdate
+            })
+          )
+          await saveUpdatesToDB(assistantMsgId, topicId, finalMessagePropertiesUpdate, blocksToAlsoSaveToDB)
+        } else {
+          // Fallback, less likely but good to handle
+          const fallbackUpdates: Partial<Message> = { status, metrics: response?.metrics, usage: response?.usage }
+          dispatch(
+            newMessagesActions.updateMessage({
+              topicId,
+              messageId: assistantMsgId,
+              updates: fallbackUpdates
+            })
+          )
+          await saveUpdatesToDB(assistantMsgId, topicId, fallbackUpdates, blocksToAlsoSaveToDB)
+        }
 
         EventEmitter.emit(EVENT_NAMES.MESSAGE_COMPLETE, { id: assistantMsgId, topicId, status })
       }
